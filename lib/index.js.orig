@@ -1,6 +1,4 @@
 var ChildProcess = require('child_process');
-var os = require('os');
-var exec = ChildProcess.exec;
 var IS_WIN = process.platform === 'win32';
 var TableParser = require( 'table-parser' );
 /**
@@ -13,42 +11,6 @@ var TableParser = require( 'table-parser' );
 var EOL = /(\r\n)|(\n\r)|\n|\r/;
 var SystemEOL = require( 'os' ).EOL;
 
-function wmic(name,callback){
-    // windows 下直接通过exec方法来wmic process get没有stdout，因此通过调用CMD的方法来做
-	var spawn = ChildProcess.spawn;
-	var CMD = spawn('cmd');
-	var stdout = [];
-	var stderr = null;
-	CMD.stdout.on('data', function (data) {
-		stdout += data.toString();
-	});
-	CMD.stderr.on('data', function (data) {
-		if( stderr === null ) stderr = data.toString();
-		else stderr += data.toString();
-	});
-	CMD.on('exit', function () {
-		var beginRow;
-		stdout = stdout.split( EOL );
-		// 寻找到数据的第一行（标题行）
-		stdout = stdout.filter((item)=>{
-			return item!=='\r\n'&&item!==''&&item !== undefined  //rm empty lines
-		})
-		stdout.forEach(function( out, index ){
-			if( out && out.indexOf( 'IDProcess' ) === 0 ){
-				beginRow = index;
-			}
-		});
-		// 去掉开头和结尾 （开头为CMD的版权等，结尾为当前路径）
-		stdout.splice( stdout.length - 1 , 1 );
-		stdout.splice( 0 , beginRow );
-		callback( stderr, stdout.join( SystemEOL ) || false );
-	});
-	// | findstr /v /c:"---"
-	let cmd = 'wmic path Win32_PerfFormattedData_PerfProc_Process where "name like \'%'+name+'%\'" get IDProcess,Name,PercentProcessorTime,WorkingSetPrivate \n'// | findstr /i /c:"---"\n'
-	
-	CMD.stdin.write(cmd);
-	CMD.stdin.end();
-}
 /**
  * Execute child process
  * @type {Function}
@@ -57,16 +19,63 @@ function wmic(name,callback){
  * @param {Object=null} callback.err
  * @param {Object[]} callback.stdout
  */
-var Exec = module.exports = exports = function( query, callback) {
+
+var Exec = module.exports = exports = function( args, callback) {
+    if (Array.isArray(args)) {
+        args = args.join(' ');
+    }
+
+    // windows 下直接通过exec方法来wmic process get没有stdout，因此通过调用CMD的方法来做
     if( IS_WIN ){
-		wmic(query.name,callback);
-    } else {
-		//console.log('args='+args)
-		let except_str = query.except?'|grep -v ' + query.except:''
-        exec( 'ps aux |head -1; ps aux|grep '+query.name+'|grep -v grep ' + except_str, function( err, stdout, stderr) {
+
+        var spawn = ChildProcess.spawn;
+        var CMD = spawn('cmd');
+        var stdout = [];
+        var stderr = null;
+
+        CMD.stdout.on('data', function (data) {
+            stdout += data.toString();
+        });
+
+        CMD.stderr.on('data', function (data) {
+
+            if( stderr === null ){
+                stderr = data.toString();
+            }
+            else {
+                stderr += data.toString();
+            }
+        });
+
+        CMD.on('exit', function () {
+
+            var beginRow;
+            stdout = stdout.split( EOL );
+
+            // 寻找到数据的第一行（标题行）
+            stdout.forEach(function( out, index ){
+                if( out && typeof beginRow == 'undefined' && out.indexOf( 'CommandLine' ) === 0 ){
+                    beginRow = index;
+                }
+            });
+
+            // 去掉开头和结尾 （开头为CMD的版权等，结尾为当前路径）
+            stdout.splice( stdout.length - 1 , 1 );
+            stdout.splice( 0 , beginRow );
+
+            callback( stderr, stdout.join( SystemEOL ) || false );
+        });
+
+        CMD.stdin.write('wmic process get ProcessId,CommandLine \n');
+        CMD.stdin.end();
+    }
+    else {
+        ChildProcess.exec( 'ps ' + args, function( err, stdout, stderr) {
+
             if (err || stderr) {
                 return callback( err || stderr.toString() );
-            }else {
+            }
+            else {
                 stdout = stdout.toString();
                 callback(null, stdout || false);
             }
@@ -91,7 +100,7 @@ exports.lookup = function(query, callback) {
     /**
      * add 'l' as default ps arguments, since the default ps output in linux like "ubuntu", wont include command arguments
      */
-    //var exeArgs = query.psargs || [ 'l' ];
+    var exeArgs = query.psargs || [ 'l' ];
     var filter = {};
     var idList;
 
@@ -125,7 +134,7 @@ exports.lookup = function(query, callback) {
         filter['ppid'] = new RegExp( query.ppid );
     }
 
-    return Exec( query, function(err, output) {
+    return Exec( exeArgs, function(err, output) {
         if (err) {
             return callback( err );
         }
@@ -208,15 +217,12 @@ function parseGrid( output ) {
 
 function formatOutput( data ){
     var formatedData = [];
-	//console.log('formatOutput:'+data)
     data.forEach(function( d ){
-		//Windows:   IDProcess,Name,PercentProcessorTime,WorkingSetPrivate
-		//Mac/Linux: PID,COMMAND,%CPU,%MEM
-        var pid = ( d.PID && d.PID[ 0 ] ) || ( d.ProcessId && d.ProcessId[ 0 ] ) || ( d.IDProcess && d.IDProcess[ 0 ] ) || undefined;
-        var cmd = d.CMD || d.CommandLine || d.COMMAND || d.Name || undefined;
-        var cpu = ( d['%CPU'] && d['%CPU'][ 0 ] ) || ( d.PercentProcessorTime && d.PercentProcessorTime[ 0 ] ) || undefined;
-        var mem = ( d['%MEM'] && d['%MEM'][ 0 ] ) || ( d.WorkingSetPrivate && d.WorkingSetPrivate[ 0 ] ) || undefined;
+        var pid = ( d.PID && d.PID[ 0 ] ) || ( d.ProcessId && d.ProcessId[ 0 ] ) || undefined;
+        var cmd = d.CMD || d.CommandLine || d.COMMAND || undefined;
         var ppid = ( d.PPID && d.PPID[ 0 ] ) || undefined;
+        var cpu = ( d['%CPU'] && d['%CPU'][ 0 ] ) || undefined;
+        var mem = ( d['%MEM'] && d['%MEM'][ 0 ] ) || undefined;
 
         if( pid && cmd ){
             var command = cmd[ 0 ];
@@ -225,8 +231,8 @@ function formatOutput( data ){
             if( cmd.length > 1 ){
                 args = cmd.slice( 1 );
             }
-			if(mem>100) mem = (100*mem/os.totalmem()).toFixed(2)
-            formatedData.push({
+
+            formatedData.push( {
                 pid: pid,
                 command: command,
                 arguments: args,
@@ -234,7 +240,6 @@ function formatOutput( data ){
                 cpu:cpu,
                 mem:mem,
             });
-			
         }
     });
 
